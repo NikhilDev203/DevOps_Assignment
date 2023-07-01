@@ -1,0 +1,167 @@
+name : 3-tier build and deployment
+trigger:
+ - none
+pool :
+ vmImage : windows-latest
+
+variables:
+  serviceConnection: 'azure-sp-nikhil'
+  appService: 'as-web-eastus-dev-01'
+
+stages:
+- stage: Terraform_iac_creation
+  jobs:
+    - job: Terraform_init_plan_apply
+      steps:
+      - task: TerraformInstaller@0
+        inputs: 
+          terraformVersion: 'latest' 
+      - task: TerraformTaskV3@3
+        inputs:
+          provider: 'azurerm'
+          command: 'init'
+          workingDirectory: 'terraform_exe'
+          backendServiceArm: $(serviceConnection)
+          backendAzureRmResourceGroupName: 'devopsrg'
+          backendAzureRmStorageAccountName: 'saterraformstate03'
+          backendAzureRmContainerName: 'tfstate'
+          backendAzureRmKey: 'terraform.tfstate'
+     
+      - task: TerraformTaskV3@3
+        inputs: 
+          provider: 'azurerm'
+          command: 'plan'
+          workingDirectory: 'terraform_exe'
+          environmentServiceNameAzureRM: $(serviceConnection)
+
+      - task: TerraformTaskV3@3
+        inputs:
+          provider: 'azurerm' 
+          command: 'apply'
+          workingDirectory: 'terraform_exe'
+          environmentServiceNameAzureRM: $(serviceConnection)
+
+
+
+- stage: Build_and_Deploy_webapp
+  jobs:
+  - job: WebApp
+    displayName: 'Build Web App'
+    variables:
+      BuildConfiguration: release
+  
+    steps: 
+    - task: UseDotNet@2
+      displayName: Install .NET 6 sdk
+      inputs:
+        packageType: sdk
+        version: 6.0.x
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+
+    - task: DotNetCoreCLI@2
+      displayName: Restore
+      inputs:
+        command: restore
+        projects: '**/WebApp.csproj'
+    
+    - task: DotNetCoreCLI@2
+      displayName: Build
+      inputs:
+        projects: '**/WebApp.csproj'
+        arguments: '--configuration $(BuildConfiguration)'
+    
+    
+    - task: DotNetCoreCLI@2
+      displayName: Publish
+      inputs:
+        command: publish
+        publishWebProjects: True
+        arguments: '--configuration $(BuildConfiguration) --output $(build.artifactstagingdirectory)'
+        zipAfterPublish: True
+    
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact (WebApp.zip)'
+      inputs:
+        PathtoPublish: '$(build.artifactstagingdirectory)'
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download WebApp.zip
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern: '**/WebApp.zip'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+
+    - task: AzureRmWebAppDeployment@4
+      inputs:
+        ConnectionType: 'AzureRM'
+        azureSubscription: $(serviceConnection)
+        appType: 'webApp'
+        WebAppName: $(appService)
+        Package: '$(System.DefaultWorkingDirectory)/drop/WebApp.zip'
+        TakeAppOfflineFlag: true
+        JSONFiles: '**/appsettings.json'
+
+
+  - job: Database
+    displayName: 'Database & configuration'
+    dependsOn: 'WebApp'
+    pool:
+      vmImage: 'windows-2019'
+
+    steps:
+    - task: MSBuild@1
+      displayName: 'Build solution WebApp.Database.sqlproj'
+      inputs:
+        solution: WebApp.Database/WebApp.Database.sqlproj
+        msbuildArguments: '/p:OutDir=$(Build.ArtifactStagingDirectory)'
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact (Dacpac)'
+      inputs:
+        ArtifactName: dacpac
+        
+    
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download DacPac
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'dacpac'
+        itemPattern: '**/*.dacpac'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+   
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: $(serviceConnection)
+        KeyVaultName: 'kv-web-eastus-dev-01'
+        SecretsFilter: 'sql-server-eastus-dev-01-key'
+        RunAsPreJob: false
+    
+    - task: SqlAzureDacpacDeployment@1
+      inputs:
+        azureSubscription: $(serviceConnection)
+        AuthenticationType: 'connectionString'
+        ConnectionString: "Server=tcp:sql-server-eastus-dev-01.database.windows.net,1433;Initial Catalog=sql-db-eastus-dev-01;Persist Security Info=False;User ID=mradministrator;Password=$(sql-server-eastus-dev-01-key);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
+        deployType: 'DacpacTask'
+        DeploymentAction: 'Publish'
+        DacpacFile: '$(System.DefaultWorkingDirectory)/dacpac/WebApp.Database.dacpac'
+        IpDetectionMethod: 'AutoDetect'
+
+
+    - task: AzureAppServiceSettings@1
+      inputs:
+        azureSubscription: $(serviceConnection)
+        appName: 'as-web-eastus-dev-01'
+        resourceGroupName: 'rg-web-eastus-dev-01'
+        connectionStrings: |
+          [
+            {
+              "name": "WebAppContext",
+              "value": "Server=tcp:sql-server-eastus-dev-01.database.windows.net,1433;Initial Catalog=sql-db-eastus-dev-01;Persist Security Info=False;User ID=mradministrator;Password=$(sql-server-eastus-dev-01-key);MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;",
+              "type": "SQLServer"
+            }
+          ]
+
